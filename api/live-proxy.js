@@ -131,7 +131,7 @@ export default async function handler(req, res) {
   if (isDash) {
     let xml = await upstream.text();
     
-    // Safety check: if upstream returned an error page instead of XML, don't parse it as MPD
+    // Strict validation to ensure upstream returned an XML file instead of a block/error page
     if (!xml.trim().startsWith('<?xml') && !xml.includes('<MPD')) {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.status(502).send('Upstream returned non-XML payload for MPD:\n' + xml.slice(0, 1000));
