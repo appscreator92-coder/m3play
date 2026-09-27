@@ -119,7 +119,8 @@ export default async function handler(req, res) {
   if (!upstream.ok) {
     const body = await upstream.text();
     res.setHeader('X-Proxy-Upstream', String(upstream.status));
-    return res.status(upstream.status).send(body.slice(0, 2000));
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    return res.status(upstream.status).send(`Upstream Error Status ${upstream.status}:\n${body.slice(0, 2000)}`);
   }
 
   const ct = upstream.headers.get('content-type') || '';
@@ -129,6 +130,13 @@ export default async function handler(req, res) {
 
   if (isDash) {
     let xml = await upstream.text();
+    
+    // Safety check: if upstream returned an error page instead of XML, don't parse it as MPD
+    if (!xml.trim().startsWith('<?xml') && !xml.includes('<MPD')) {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      return res.status(502).send('Upstream returned non-XML payload for MPD:\n' + xml.slice(0, 1000));
+    }
+
     const base = `https://${req.headers.host}/api/live-proxy`;
     const extras =
       (cookie ? '&cookie=' + encodeURIComponent(cookie) : '') +
@@ -136,7 +144,6 @@ export default async function handler(req, res) {
       (ua ? '&ua=' + encodeURIComponent(ua) : '') +
       (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
 
-    const parentUrl = targetUrl.toString();
     const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
 
     xml = xml.replace(/<SegmentTemplate\b([^>]*?)>/g, (match, attrs) => {
