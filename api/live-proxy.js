@@ -1,21 +1,6 @@
 /* A stream proxy that runs in Mumbai, and borrows an Indian address when
  * Mumbai is not enough.
  *
- * Measured against four CDN hosts from five hosting providers:
- *
- *     Indian ISP / residential     FanCode 200   SonyLiv 200   Hotstar 200
- *     Indian datacenter (any)      FanCode 200   SonyLiv 403   Hotstar 403
- *     outside India (any)          FanCode 403   SonyLiv 403   Hotstar 403
- *
- * Two different blocks, so two different answers. FanCode's is geographic
- * alone, and this function being pinned to bom1 clears it — see vercel.json,
- * without which nothing here works. SonyLiv and Hotstar additionally refuse
- * hosted networks, which no cloud region anywhere can help with, so for those
- * the request is forwarded through a public proxy on an Indian consumer or
- * campus network. Those proxies are strangers' machines: fine for a public
- * stream signed with a token that expires in hours, and not a thing to send
- * anything private through.
- *
  *   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port]
  */
 import { ProxyAgent } from 'undici';
@@ -23,12 +8,7 @@ import { ProxyAgent } from 'undici';
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 
-/* Only these hosts, so this cannot be used as an open relay for anything on
-   the internet. It is a public URL on a domain you own. */
 const ALLOWED = ['fancode.com', 'akamaized.net', 'hotstar.com', 'jio.com'];
-
-/* Hosts that want an address no datacenter has. Everything else is served
-   straight from Mumbai, which is faster and does not depend on a stranger. */
 const NEEDS_RESIDENTIAL = [
   'sonydaimenew.akamaized.net',
   'live09p.hotstar.com',
@@ -41,11 +21,8 @@ const PROXY_LIST =
 const allowed = (h) => ALLOWED.some(s => h === s || h.endsWith('.' + s));
 const needsResidential = (h) => NEEDS_RESIDENTIAL.some(s => h === s || h.endsWith('.' + s));
 
-// ── the proxy pool ───────────────────────────────────────────
-/* Kept on the module, which on a warm instance survives between requests.
-   A cold start pays for the list again; that is one small fetch. */
 let pool = { list: [], at: 0 };
-let known = new Map();          // hostname -> proxy that last worked for it
+let known = new Map();
 
 async function proxyList() {
   if (pool.list.length && Date.now() - pool.at < 15 * 60_000) return pool.list;
@@ -65,12 +42,6 @@ function get(url, headers, proxy, ms) {
   return fetch(url, opts);
 }
 
-/* Find a proxy that this particular host accepts.
- *
- * Most entries on a public list are dead, so they are raced in batches rather
- * than tried one after another — serially this would exhaust the function's
- * time long before finding the one that works. The winner is remembered per
- * host, because what SonyLiv accepts and what Hotstar accepts need not match. */
 async function findProxy(url, headers, hostname, skip = '') {
   const list = await proxyList();
   if (!list.length) return null;
@@ -109,7 +80,7 @@ export default async function handler(req, res) {
   if (!allowed(targetUrl.hostname)) return res.status(403).send('Host not allowed');
 
   let refOrigin = targetUrl.origin;
-  if (ref) { try { refOrigin = new URL(ref).origin; } catch { /* keep the target's */ } }
+  if (ref) { try { refOrigin = new URL(ref).origin; } catch { /* keep target's */ } }
 
   const headers = {
     'User-Agent': ua || DEFAULT_UA,
@@ -122,12 +93,6 @@ export default async function handler(req, res) {
   let upstream, usedProxy = '';
   try {
     if (via) {
-      /* A playlist names the proxy that fetched it, so its segments go the
-         same way instead of each one searching the pool again. Public proxies
-         die mid-stream, though, so a pinned one that throws or refuses is
-         dropped and the pool is searched again rather than failing the
-         segment — the player only sees a slower fetch, not an error. */
-      /* If a later request already replaced a dead pin, go the way that works. */
       const pinned = known.get(targetUrl.hostname) || via;
       usedProxy = pinned;
       try { upstream = await get(targetUrl.toString(), headers, pinned, 8000); }
@@ -151,9 +116,6 @@ export default async function handler(req, res) {
 
   if (usedProxy) res.setHeader('X-Proxy-Via', usedProxy);
 
-  /* A refusal is not a playlist, whatever the path says. Rewriting an HTML
-     error page as one turns each of its lines into a proxy URL, and the player
-     then gets a 200-looking manifest of nonsense instead of the reason. */
   if (!upstream.ok) {
     const body = await upstream.text();
     res.setHeader('X-Proxy-Upstream', String(upstream.status));
@@ -165,8 +127,6 @@ export default async function handler(req, res) {
   const isPlaylist = lower.endsWith('.m3u8') || ct.includes('mpegurl');
   const isDash = lower.endsWith('.mpd') || ct.includes('dash+xml');
 
-  /* Rewrites DASH segment templates so they route through the proxy instead
-     of hitting the origin directly with unproxied datacenter IPs. */
   if (isDash) {
     let xml = await upstream.text();
     const base = `https://${req.headers.host}${req.url.split('?')[0]}`;
@@ -189,17 +149,20 @@ export default async function handler(req, res) {
       return base + '?url=' + encodeURIComponent(abs) + extras;
     };
 
-    xml = xml.replace(/\b(media|initialization)="([^"]+)"/g, (match, attr, val) => {
-      if (val.startsWith('http://') || val.startsWith('https://')) {
-        return `${attr}="${wrapSegment(val)}"`;
-      }
-      let abs;
-      try {
-        abs = new URL(val, dir).toString();
-      } catch {
-        abs = val;
-      }
-      return `${attr}="${base + '?url=' + encodeURIComponent(abs) + extras}"`;
+    xml = xml.replace(/<SegmentTemplate\b([^>]*)>/g, (match, attrs) => {
+      let updatedAttrs = attrs.replace(/\b(media|initialization)="([^"]+)"/g, (m, attr, val) => {
+        if (val.startsWith('http://') || val.startsWith('https://')) {
+          return `${attr}="${wrapSegment(val)}"`;
+        }
+        let abs;
+        try {
+          abs = new URL(val, dir).toString();
+        } catch {
+          abs = val;
+        }
+        return `${attr}="${base + '?url=' + encodeURIComponent(abs) + extras}"`;
+      });
+      return `<SegmentTemplate ${updatedAttrs}>`;
     });
 
     res.setHeader('Content-Type', 'application/dash+xml');
@@ -216,10 +179,6 @@ export default async function handler(req, res) {
       (ua ? '&ua=' + encodeURIComponent(ua) : '') +
       (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
 
-    /* A child with no query of its own inherits the parent's. FanCode and
-       SonyLiv sign in the query with an acl covering the folder, and resolving
-       a relative reference drops it — without this the master plays and every
-       variant comes back 403. */
     const parentQuery = targetUrl.search;
     const toAbs = (r) => {
       const u = new URL(r, targetUrl);
@@ -240,7 +199,6 @@ export default async function handler(req, res) {
     return res.status(200).send(body);
   }
 
-  // Segments and keys: hand the bytes back with CORS added.
   res.setHeader('Content-Type', ct || 'application/octet-stream');
   res.setHeader('Cache-Control', upstream.headers.get('cache-control') || 'no-cache');
   return res.status(200).send(Buffer.from(await upstream.arrayBuffer()));
