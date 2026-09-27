@@ -165,22 +165,43 @@ export default async function handler(req, res) {
   const isPlaylist = lower.endsWith('.m3u8') || ct.includes('mpegurl');
   const isDash = lower.endsWith('.mpd') || ct.includes('dash+xml');
 
-  /* A DASH manifest is not rewritten line by line — its segment names live in
-     templates, not as URLs — so the player resolves them against wherever it
-     fetched the manifest from, which is this proxy. Left alone it then asks
-     the proxy for paths on the proxy's own domain.
-   
-     Giving the manifest an absolute BaseURL pointing back at the real
-     directory fixes that at the source: every segment resolves to a real
-     Hotstar URL, and the player's request filter wraps each one on its way
-     out. A manifest that already declares an absolute BaseURL is left alone —
-     it has already said where its segments live. */
+  /* Rewrites DASH segment templates so they route through the proxy instead
+     of hitting the origin directly with unproxied datacenter IPs. */
   if (isDash) {
     let xml = await upstream.text();
+    const base = `https://${req.headers.host}${req.url.split('?')[0]}`;
+    const extras =
+      (cookie ? '&cookie=' + encodeURIComponent(cookie) : '') +
+      (ref ? '&ref=' + encodeURIComponent(ref) : '') +
+      (ua ? '&ua=' + encodeURIComponent(ua) : '') +
+      (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
+
+    const parentUrl = targetUrl.toString();
     const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
-    if (!/<BaseURL>\s*https?:/i.test(xml)) {
-      xml = xml.replace(/(<MPD\b[^>]*>)/i, `$1<BaseURL>${dir}</BaseURL>`);
-    }
+
+    const wrapSegment = (mediaPath) => {
+      let abs;
+      try {
+        abs = new URL(mediaPath, parentUrl).toString();
+      } catch {
+        abs = mediaPath;
+      }
+      return base + '?url=' + encodeURIComponent(abs) + extras;
+    };
+
+    xml = xml.replace(/\b(media|initialization)="([^"]+)"/g, (match, attr, val) => {
+      if (val.startsWith('http://') || val.startsWith('https://')) {
+        return `${attr}="${wrapSegment(val)}"`;
+      }
+      let abs;
+      try {
+        abs = new URL(val, dir).toString();
+      } catch {
+        abs = val;
+      }
+      return `${attr}="${base + '?url=' + encodeURIComponent(abs) + extras}"`;
+    });
+
     res.setHeader('Content-Type', 'application/dash+xml');
     res.setHeader('Cache-Control', 'no-cache');
     return res.status(200).send(xml);
