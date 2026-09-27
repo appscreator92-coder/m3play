@@ -1,7 +1,7 @@
 /* A stream proxy that runs in Mumbai, and borrows an Indian address when
  * Mumbai is not enough.
  *
- *   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port][&keyId=][&key=]
+ *   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port]
  */
 import { ProxyAgent } from 'undici';
 
@@ -129,19 +129,28 @@ export default async function handler(req, res) {
 
   if (isDash) {
     let xml = await upstream.text();
-    const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
-    const base = `https://${req.headers.host}${req.url.split('?')[0]}`;
+    const base = `https://${req.headers.host}/api/live-proxy`;
     const extras =
       (cookie ? '&cookie=' + encodeURIComponent(cookie) : '') +
       (ref ? '&ref=' + encodeURIComponent(ref) : '') +
       (ua ? '&ua=' + encodeURIComponent(ua) : '') +
       (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
 
-    const proxyBaseDir = base + '?url=' + encodeURIComponent(dir) + extras;
-    
-    if (!/<BaseURL>/i.test(xml)) {
-      xml = xml.replace(/(<MPD\b[^>]*>)/i, `$1<BaseURL>${proxyBaseDir}</BaseURL>`);
-    }
+    const parentUrl = targetUrl.toString();
+    const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
+
+    xml = xml.replace(/<SegmentTemplate\b([^>]*?)>/g, (match, attrs) => {
+      let updated = attrs.replace(/\b(media|initialization)="([^"]+)"/g, (m, attr, val) => {
+        let abs;
+        try {
+          abs = new URL(val, dir).toString();
+        } catch {
+          abs = val;
+        }
+        return `${attr}="${base + '?url=' + encodeURIComponent(abs) + extras}"`;
+      });
+      return `<SegmentTemplate ${updated}>`;
+    });
 
     res.setHeader('Content-Type', 'application/dash+xml');
     res.setHeader('Cache-Control', 'no-cache');
