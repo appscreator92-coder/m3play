@@ -1,7 +1,7 @@
 /* A stream proxy that runs in Mumbai, and borrows an Indian address when
  * Mumbai is not enough.
  *
- *   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port]
+ *   GET /api/live-proxy?url=<encoded>[&cookie=][&ref=][&ua=][&via=host:port][&keyId=][&key=]
  */
 import { ProxyAgent } from 'undici';
 
@@ -129,6 +129,7 @@ export default async function handler(req, res) {
 
   if (isDash) {
     let xml = await upstream.text();
+    const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
     const base = `https://${req.headers.host}${req.url.split('?')[0]}`;
     const extras =
       (cookie ? '&cookie=' + encodeURIComponent(cookie) : '') +
@@ -136,34 +137,11 @@ export default async function handler(req, res) {
       (ua ? '&ua=' + encodeURIComponent(ua) : '') +
       (usedProxy ? '&via=' + encodeURIComponent(usedProxy) : '');
 
-    const parentUrl = targetUrl.toString();
-    const dir = targetUrl.href.slice(0, targetUrl.href.lastIndexOf('/') + 1);
-
-    const wrapSegment = (mediaPath) => {
-      let abs;
-      try {
-        abs = new URL(mediaPath, parentUrl).toString();
-      } catch {
-        abs = mediaPath;
-      }
-      return base + '?url=' + encodeURIComponent(abs) + extras;
-    };
-
-    xml = xml.replace(/<SegmentTemplate\b([^>]*)>/g, (match, attrs) => {
-      let updatedAttrs = attrs.replace(/\b(media|initialization)="([^"]+)"/g, (m, attr, val) => {
-        if (val.startsWith('http://') || val.startsWith('https://')) {
-          return `${attr}="${wrapSegment(val)}"`;
-        }
-        let abs;
-        try {
-          abs = new URL(val, dir).toString();
-        } catch {
-          abs = val;
-        }
-        return `${attr}="${base + '?url=' + encodeURIComponent(abs) + extras}"`;
-      });
-      return `<SegmentTemplate ${updatedAttrs}>`;
-    });
+    const proxyBaseDir = base + '?url=' + encodeURIComponent(dir) + extras;
+    
+    if (!/<BaseURL>/i.test(xml)) {
+      xml = xml.replace(/(<MPD\b[^>]*>)/i, `$1<BaseURL>${proxyBaseDir}</BaseURL>`);
+    }
 
     res.setHeader('Content-Type', 'application/dash+xml');
     res.setHeader('Cache-Control', 'no-cache');
